@@ -8,6 +8,8 @@ using System.Linq.Expressions;
 using System.Reflection;
 using System.Threading;
 using System.Threading.Tasks;
+using System.Data;
+using Microsoft.EntityFrameworkCore.Metadata;
 
 namespace EFCore.BulkExtensions.SqlAdapters.SQLite;
 /// <inheritdoc/>
@@ -27,7 +29,7 @@ public class SqliteOperationsAdapter : ISqlOperationsAdapter
     {
         await InsertAsync(context, type, entities, tableInfo, progress, isAsync: true, cancellationToken).ConfigureAwait(false);
     }
-    
+
     /// <inheritdoc/>
     public static async Task InsertAsync<T>(DbContext context, Type type, IList<T> entities, TableInfo tableInfo, Action<decimal>? progress, bool isAsync, CancellationToken cancellationToken)
     {
@@ -62,12 +64,19 @@ public class SqliteOperationsAdapter : ISqlOperationsAdapter
 
             var command = GetSqliteCommand(context, type, entities, tableInfo, connection, transaction);
 
-            type = tableInfo.HasAbstractList ? entities[0]!.GetType() : type;
+            var (properties, entityPropertiesDict, entityShadowFkPropertiesDict, entityShadowFkPropertyColumnNamesDict, shadowPropertyColumnNamesDict) = GetInsertPropterties(context, type, tableInfo);
+
+            var propertiesToLoad = properties
+                .Where(a => !tableInfo.AllNavigationsDictionary.ContainsKey(a.Name)
+                            || entityShadowFkPropertiesDict.ContainsKey(a.Name)
+                            || tableInfo.OwnedTypesDict.ContainsKey(a.Name)).ToArray();
+
             int rowsCopied = 0;
 
             foreach (var item in entities)
             {
-                LoadSqliteValues(tableInfo, item, command, context);
+                LoadSqliteValues(tableInfo, item, command, context, propertiesToLoad, entityPropertiesDict, entityShadowFkPropertiesDict, entityShadowFkPropertyColumnNamesDict, shadowPropertyColumnNamesDict);
+
                 if (isAsync)
                 {
                     await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
@@ -111,7 +120,7 @@ public class SqliteOperationsAdapter : ISqlOperationsAdapter
     {
         await MergeAsync(context, type, entities, tableInfo, operationType, progress, isAsync: true, cancellationToken);
     }
-    
+
     /// <inheritdoc/>
     protected static async Task MergeAsync<T>(DbContext context, Type type, IList<T> entities, TableInfo tableInfo, OperationType operationType, Action<decimal>? progress, bool isAsync, CancellationToken cancellationToken) where T : class
     {
@@ -132,12 +141,18 @@ public class SqliteOperationsAdapter : ISqlOperationsAdapter
 
             var command = GetSqliteCommand(context, type, entities, tableInfo, connection, transaction);
 
-            type = tableInfo.HasAbstractList ? entities[0].GetType() : type;
+            var (properties, entityPropertiesDict, entityShadowFkPropertiesDict, entityShadowFkPropertyColumnNamesDict, shadowPropertyColumnNamesDict) = GetInsertPropterties(context, type, tableInfo);
+
+            var propertiesToLoad = properties
+                .Where(a => !tableInfo.AllNavigationsDictionary.ContainsKey(a.Name)
+                            || entityShadowFkPropertiesDict.ContainsKey(a.Name)
+                            || tableInfo.OwnedTypesDict.ContainsKey(a.Name)).ToArray();
+
             int rowsCopied = 0;
 
             foreach (var item in entities)
             {
-                LoadSqliteValues(tableInfo, item, command, context);
+                LoadSqliteValues(tableInfo, item, command, context, propertiesToLoad, entityPropertiesDict, entityShadowFkPropertiesDict, entityShadowFkPropertyColumnNamesDict, shadowPropertyColumnNamesDict);
                 if (isAsync)
                 {
                     await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
@@ -189,7 +204,7 @@ public class SqliteOperationsAdapter : ISqlOperationsAdapter
     {
         await ReadAsync(context, type, entities, tableInfo, progress, isAsync: true, cancellationToken).ConfigureAwait(false);
     }
-    
+
     /// <inheritdoc/>
     protected static async Task ReadAsync<T>(DbContext context, Type type, IList<T> entities, TableInfo tableInfo, Action<decimal>? progress, bool isAsync, CancellationToken cancellationToken) where T : class
     {
@@ -341,26 +356,55 @@ public class SqliteOperationsAdapter : ISqlOperationsAdapter
                 break;
         }
 
+        var objectIdentifier = tableInfo.ObjectIdentifier;
         type = tableInfo.HasAbstractList ? entities[0]?.GetType() : type;
         if (type is null)
         {
             throw new ArgumentException("Unable to determine entity type");
         }
-        var entityType = context.Model.FindEntityType(type);
-        var entityPropertiesDict = entityType?.GetProperties().Where(a => tableInfo.PropertyColumnNamesDict.ContainsKey(a.Name)).ToDictionary(a => a.Name, a => a);
-        var properties = type.GetProperties(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+
+        var (properties, entityPropertiesDict, entityShadowFkPropertiesDict, entityShadowFkPropertyColumnNamesDict, shadowPropertyColumnNamesDict) = GetInsertPropterties(context, type, tableInfo);
 
         foreach (var property in properties)
         {
-            if (entityPropertiesDict?.ContainsKey(property.Name) ?? false)
+            var hasDefaultVauleOnInsert = tableInfo.BulkConfig.OperationType == OperationType.Insert
+                && !tableInfo.BulkConfig.SetOutputIdentity
+                && tableInfo.DefaultValueProperties.Contains(property.Name);
+
+            if (entityPropertiesDict.ContainsKey(property.Name))
             {
                 var propertyEntityType = entityPropertiesDict[property.Name];
-                string? columnName = propertyEntityType.GetColumnName(tableInfo.ObjectIdentifier);
+                string columnName = propertyEntityType.GetColumnName(objectIdentifier) ?? string.Empty;
                 var propertyType = Nullable.GetUnderlyingType(property.PropertyType) ?? property.PropertyType;
 
                 //SqliteType(CpropertyType.Name): Text(String, Decimal, DateTime); Integer(Int16, Int32, Int64) Real(Float, Double) Blob(Guid)
-                var parameter = new SqliteParameter($"@{property.Name}", propertyType); // ,sqliteType // ,null //()
+                var parameter = new SqliteParameter($"@{columnName}", propertyType); // ,sqliteType // ,null //()
                 command.Parameters.Add(parameter);
+            }
+            else if (entityShadowFkPropertiesDict.ContainsKey(property.Name))
+            {
+                var fk = entityShadowFkPropertiesDict[property.Name];
+
+                entityPropertiesDict.TryGetValue(fk.GetColumnName(objectIdentifier) ?? string.Empty, out var entityProperty);
+                if (entityProperty == null) // BulkRead
+                    continue;
+
+                var columnName = entityProperty.GetColumnName(objectIdentifier);
+
+                var isConvertible = tableInfo.ConvertibleColumnConverterDict.ContainsKey(columnName ?? string.Empty);
+                var propertyType = isConvertible ? tableInfo.ConvertibleColumnConverterDict[columnName ?? string.Empty].ProviderClrType : entityProperty.ClrType;
+
+                var underlyingType = Nullable.GetUnderlyingType(propertyType);
+                if (underlyingType != null)
+                {
+                    propertyType = underlyingType;
+                }
+
+                if (columnName is not null && !hasDefaultVauleOnInsert)
+                {
+                    var parameter = new SqliteParameter($"@{columnName}", propertyType); // ,sqliteType // ,null //()
+                    command.Parameters.Add(parameter);
+                }
             }
         }
 
@@ -375,77 +419,128 @@ public class SqliteOperationsAdapter : ISqlOperationsAdapter
         return command;
     }
 
-    internal static void LoadSqliteValues<T>(TableInfo tableInfo, T? entity, SqliteCommand command, DbContext dbContext)
+    private static (PropertyInfo[], Dictionary<string, IProperty>, Dictionary<string, IProperty>, Dictionary<string, string?>, Dictionary<string, string?>) GetInsertPropterties(DbContext context, Type type, TableInfo tableInfo )
     {
-        var propertyColumnsDict = tableInfo.PropertyColumnNamesDict;
-        foreach (var propertyColumn in propertyColumnsDict)
+        var entityType = context.Model.FindEntityType(type) ?? throw new ArgumentException($"Unable to determine entity type from given type - {type.Name}");
+        var entityTypeProperties = entityType.GetProperties();
+        var entityPropertiesDict = entityTypeProperties.Where(a => tableInfo.PropertyColumnNamesDict.ContainsKey(a.Name)).ToDictionary(a => a.Name, a => a);
+        var properties = type.GetProperties(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+
+        var entityShadowFkPropertiesDict = entityTypeProperties.Where(a => a.IsShadowProperty() &&
+                                                                   a.IsForeignKey() &&
+                                                                   a.GetContainingForeignKeys().FirstOrDefault()?.DependentToPrincipal?.Name != null)
+                                                             .ToDictionary(x => x.GetContainingForeignKeys()?.First()?.DependentToPrincipal?.Name ?? string.Empty, a => a);
+        var entityShadowFkPropertyColumnNamesDict = entityShadowFkPropertiesDict
+            .ToDictionary(a => a.Key, a => a.Value.GetColumnName(tableInfo.ObjectIdentifier));
+        var shadowPropertyColumnNamesDict = entityPropertiesDict
+            .Where(a => a.Value.IsShadowProperty()).ToDictionary(a => a.Key, a => a.Value.GetColumnName(tableInfo.ObjectIdentifier));
+
+        return (properties, entityPropertiesDict, entityShadowFkPropertiesDict, entityShadowFkPropertyColumnNamesDict, shadowPropertyColumnNamesDict);
+    }
+
+    internal static void LoadSqliteValues<T>(TableInfo tableInfo, T? entity, SqliteCommand command, DbContext dbContext, IEnumerable<PropertyInfo> properties, Dictionary<string, IProperty> entityPropertiesDict, Dictionary<string, IProperty> entityShadowFkPropertiesDict, Dictionary<string, string?> entityShadowFkPropertyColumnNamesDict, Dictionary<string, string?> shadowPropertyColumnNamesDict)
+    { 
+        foreach (var propertyColumn in properties)
         {
-            var isShadowProperty = tableInfo.ShadowProperties.Contains(propertyColumn.Key);
-            string parameterName = propertyColumn.Key.Replace(".", "_");
+            string parameterName = propertyColumn.Name;
             object? value;
-            if (!isShadowProperty)
+            if (parameterName.Contains('_')) // ToDo: change IF clause to check for NavigationProperties, optimise, integrate with same code segment from LoadData method
             {
-                if (propertyColumn.Key.Contains('.')) // ToDo: change IF clause to check for NavigationProperties, optimise, integrate with same code segment from LoadData method
+                var ownedPropertyNameList = parameterName.Split('_');
+                var ownedPropertyName = ownedPropertyNameList[0];
+                var subPropertyName = ownedPropertyNameList[1];
+                var ownedFastProperty = tableInfo.FastPropertyDict[ownedPropertyName];
+                var ownedProperty = ownedFastProperty.Property;
+
+                var propertyType = Nullable.GetUnderlyingType(ownedProperty.GetType()) ?? ownedProperty.GetType();
+                if (!command.Parameters.Contains("@" + parameterName))
                 {
-                    var ownedPropertyNameList = propertyColumn.Key.Split('.');
-                    var ownedPropertyName = ownedPropertyNameList[0];
-                    var subPropertyName = ownedPropertyNameList[1];
-                    var ownedFastProperty = tableInfo.FastPropertyDict[ownedPropertyName];
-                    var ownedProperty = ownedFastProperty.Property;
+                    var parameter = new SqliteParameter($"@{parameterName}", propertyType);
+                    command.Parameters.Add(parameter);
+                }
 
-                    var propertyType = Nullable.GetUnderlyingType(ownedProperty.GetType()) ?? ownedProperty.GetType();
-                    if (!command.Parameters.Contains("@" + parameterName))
-                    {
-                        var parameter = new SqliteParameter($"@{parameterName}", propertyType);
-                        command.Parameters.Add(parameter);
-                    }
-
-                    if (ownedProperty == null)
-                    {
-                        value = null;
-                    }
-                    else
-                    {
-                        var ownedPropertyValue = entity == null ? null : tableInfo.FastPropertyDict[ownedPropertyName].Get(entity);
-                        var subPropertyFullName = $"{ownedPropertyName}_{subPropertyName}";
-                        value = ownedPropertyValue == null ? null : tableInfo.FastPropertyDict[subPropertyFullName]?.Get(ownedPropertyValue);
-                    }
+                if (ownedProperty == null)
+                {
+                    value = null;
                 }
                 else
                 {
-                    value = entity is null ? null : tableInfo.FastPropertyDict[propertyColumn.Key].Get(entity);
+                    var ownedPropertyValue = entity == null ? null : tableInfo.FastPropertyDict[ownedPropertyName].Get(entity);
+                    var subPropertyFullName = $"{ownedPropertyName}_{subPropertyName}";
+                    value = ownedPropertyValue == null ? null : tableInfo.FastPropertyDict[subPropertyFullName]?.Get(ownedPropertyValue);
                 }
             }
             else
             {
-                if (tableInfo.BulkConfig.EnableShadowProperties)
+                if (entityPropertiesDict.ContainsKey(parameterName))
                 {
-                    if (tableInfo.BulkConfig.ShadowPropertyValue == null)
+                    value = tableInfo.FastPropertyDict.ContainsKey(parameterName)
+                        ? tableInfo.FastPropertyDict[parameterName].Get(entity!)
+                        : null;
+                }
+                else if (entityShadowFkPropertiesDict.ContainsKey(parameterName))
+                {
+                    var foreignKeyShadowProperty = entityShadowFkPropertiesDict[parameterName];
+                    var columnName = entityShadowFkPropertyColumnNamesDict[parameterName] ?? string.Empty;
+                    if (!entityPropertiesDict.TryGetValue(columnName, out var entityProperty) || entityProperty is null)
                     {
-                        value = entity is null ? null : dbContext.Entry(entity).Property(propertyColumn.Key).CurrentValue; // Get the shadow property value
-                    }
-                    else
-                    {
-                        value = entity is null ? null : tableInfo.BulkConfig.ShadowPropertyValue(entity, propertyColumn.Key);
-                    }
+                        continue; // BulkRead
+                    };
+                    value = tableInfo.FastPropertyDict.ContainsKey(parameterName)
+                        ? tableInfo.FastPropertyDict[parameterName].Get(entity!)
+                        : null;
+                    parameterName = columnName;
+                    value = value == null
+                        ? null
+                        : foreignKeyShadowProperty.FindFirstPrincipal()?.PropertyInfo?.GetValue(value); // TODO Check if can be optimized
+                }
+                else {
+                    value = null;
+                }
+            }
 
 
+            if (value is not null) {
+                if (tableInfo.ConvertibleColumnConverterDict.ContainsKey(parameterName) && value != DBNull.Value)
+                {
+                    value = tableInfo.ConvertibleColumnConverterDict[parameterName].ConvertToProvider.Invoke(value);
+                }
+
+                command.Parameters[$"@{parameterName}"].Value = value ?? DBNull.Value;
+            }
+        }
+
+        if (tableInfo.BulkConfig.EnableShadowProperties)
+        {
+            foreach (var shadowPropertyName in shadowPropertyColumnNamesDict.Keys)
+            {
+                var shadowProperty = entityPropertiesDict[shadowPropertyName];
+                var columnName = shadowPropertyColumnNamesDict[shadowPropertyName] ?? string.Empty;
+
+                var propertyValue = default(object);
+
+                if (tableInfo.BulkConfig.ShadowPropertyValue == null)
+                {
+                    propertyValue = dbContext.Entry(entity!).Property(shadowPropertyName).CurrentValue;
                 }
                 else
                 {
-                    value = entity is null ? null : dbContext.Entry(entity).Metadata.GetDiscriminatorValue(); // Set the value for the discriminator column
+                    propertyValue = tableInfo.BulkConfig.ShadowPropertyValue(entity!, shadowPropertyName);
                 }
-            }
 
-            if (tableInfo.ConvertibleColumnConverterDict.ContainsKey(propertyColumn.Value) && value != DBNull.Value)
-            {
-                value = tableInfo.ConvertibleColumnConverterDict[propertyColumn.Value].ConvertToProvider.Invoke(value);
+                if (tableInfo.ConvertibleColumnConverterDict.ContainsKey(columnName))
+                {
+                    propertyValue = tableInfo.ConvertibleColumnConverterDict[columnName].ConvertToProvider.Invoke(propertyValue);
+                }
+                command.Parameters[$"@{shadowPropertyName}"].Value = propertyValue ?? DBNull.Value;
             }
-
-            command.Parameters[$"@{parameterName}"].Value = value ?? DBNull.Value;
         }
+        //else
+        //{
+        //    value = entity is null ? null : dbContext.Entry(entity).Metadata.GetDiscriminatorValue(); // Set the value for the discriminator column
+        //}
     }
-    
+
     /// <inheritdoc/>
     public static void SetIdentityForOutput<T>(IList<T> entities, TableInfo tableInfo, object? lastRowIdScalar)
     {
